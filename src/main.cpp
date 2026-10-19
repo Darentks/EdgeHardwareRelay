@@ -99,10 +99,12 @@ bool initCamera() {
     config.frame_size   = FRAMESIZE_VGA;   // 640x480
     config.jpeg_quality = 12;              // High quality
     config.fb_count     = 2;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
   } else {
     config.frame_size   = FRAMESIZE_QVGA;  // 320x240 fallback if no PSRAM
     config.jpeg_quality = 15;
     config.fb_count     = 1;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
   }
 
   esp_err_t err = esp_camera_init(&config);
@@ -127,6 +129,33 @@ bool initCamera() {
   return true;
 }
 
+// Helper to flush DMA ring buffer and grab a fresh real-time frame
+camera_fb_t* captureFreshFrame(bool useFlash) {
+  // First, flush any stale frame sitting in the OV2640 DMA buffer
+  camera_fb_t* stale = esp_camera_fb_get();
+  if (stale) {
+    esp_camera_fb_return(stale);
+  }
+
+  // Next, if useFlash is true, turn LED_FLASH_PIN HIGH and delay(60)
+  #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
+    if (useFlash) {
+      digitalWrite(LED_FLASH_PIN, HIGH);
+      delay(60);
+    }
+  #endif
+
+  camera_fb_t* fb = esp_camera_fb_get();
+
+  #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
+    if (useFlash) {
+      digitalWrite(LED_FLASH_PIN, LOW);
+    }
+  #endif
+
+  return fb;
+}
+
 // =========================================================================
 // 5. ONBOARD HTTP SNAPSHOT SERVER (PORT 80)
 //    - GET /capture?mode=baseline : Serves cached 30s baseline JPEG
@@ -138,6 +167,8 @@ void setupHttpServer() {
     httpServer.sendHeader("Access-Control-Allow-Origin", "*");
     httpServer.sendHeader("Access-Control-Allow-Private-Network", "true");
     httpServer.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    httpServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpServer.sendHeader("Pragma", "no-cache");
     StaticJsonDocument<256> doc;
     doc["status"]         = "ok";
     doc["device_id"]      = DEVICE_ID;
@@ -155,6 +186,8 @@ void setupHttpServer() {
     httpServer.sendHeader("Access-Control-Allow-Origin", "*");
     httpServer.sendHeader("Access-Control-Allow-Private-Network", "true");
     httpServer.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    httpServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpServer.sendHeader("Pragma", "no-cache");
 
     // Check if mode=baseline is requested and cache is available
     if (httpServer.arg("mode") == "baseline" && latestBaselineBuf != nullptr && latestBaselineLen > 0) {
@@ -169,20 +202,7 @@ void setupHttpServer() {
       useFlash = false;
     }
 
-    #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
-      if (useFlash) {
-        digitalWrite(LED_FLASH_PIN, HIGH);
-        delay(40);
-      }
-    #endif
-
-    camera_fb_t * fb = esp_camera_fb_get();
-
-    #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
-      if (useFlash) {
-        digitalWrite(LED_FLASH_PIN, LOW);
-      }
-    #endif
+    camera_fb_t * fb = captureFreshFrame(useFlash);
 
     if (!fb) {
       httpServer.send(500, "application/json", "{\"error\":\"Snapshot capture failed\"}");
@@ -204,16 +224,7 @@ void setupHttpServer() {
 void captureAndCacheBaseline() {
   if (!isCameraInitialized) return;
 
-  #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
-    digitalWrite(LED_FLASH_PIN, HIGH);
-    delay(40);
-  #endif
-
-  camera_fb_t * fb = esp_camera_fb_get();
-
-  #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
-    digitalWrite(LED_FLASH_PIN, LOW);
-  #endif
+  camera_fb_t * fb = captureFreshFrame(true);
 
   if (!fb) {
     Serial.println("[-] Failed to capture baseline frame.");
@@ -271,21 +282,7 @@ void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture =
   Serial.printf("\n[+] Trigger Received (%s): Localized snapshot on %s...\n",
                 isReferenceCapture ? "REFERENCE_SAMPLE" : "STATE_VALIDATION", SHELF_ID);
 
-  // Flash illumination pulse
-  #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
-    if (flashEnabled) {
-      digitalWrite(LED_FLASH_PIN, HIGH);
-      delay(40);
-    }
-  #endif
-
-  camera_fb_t * fb = esp_camera_fb_get();
-
-  #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
-    if (flashEnabled) {
-      digitalWrite(LED_FLASH_PIN, LOW);
-    }
-  #endif
+  camera_fb_t * fb = captureFreshFrame(flashEnabled);
 
   if (!fb) {
     Serial.println("[-] ERROR: Snapshot capture failed!");
@@ -419,19 +416,18 @@ void ensureMQTTConnected() {
     if (WiFi.status() != WL_CONNECTED) return;
   }
 
-  unsigned long now = millis();
-  if (now - lastMqttRetryTime >= 10000 || lastMqttRetryTime == 0) {
-    lastMqttRetryTime = now;
-    Serial.printf("[MQTT] Connecting to broker %s:%d...\n", MQTT_BROKER_IP, MQTT_PORT);
-    if (mqttClient.connect(DEVICE_ID)) {
-      Serial.println("[MQTT] Connected successfully!");
-      mqttClient.subscribe(trigger_topic);
-      mqttClient.subscribe(config_topic);
-      Serial.printf("[MQTT Subscribed] Trigger: %s | Reference Config: %s\n", trigger_topic, config_topic);
-      publishHealthTelemetry("BOOT_CONNECT");
-    } else {
-      Serial.printf("[-] MQTT connect failed, state=%d. Will retry in 10s in background...\n", mqttClient.state());
-    }
+  if (millis() - lastMqttRetryTime < 10000 && lastMqttRetryTime != 0) return;
+  lastMqttRetryTime = millis();
+
+  Serial.printf("[MQTT] Connecting to broker %s:%d...\n", MQTT_BROKER_IP, MQTT_PORT);
+  if (mqttClient.connect(DEVICE_ID)) {
+    Serial.println("[MQTT] Connected successfully!");
+    mqttClient.subscribe(trigger_topic);
+    mqttClient.subscribe(config_topic);
+    Serial.printf("[MQTT Subscribed] Trigger: %s | Reference Config: %s\n", trigger_topic, config_topic);
+    publishHealthTelemetry("BOOT_CONNECT");
+  } else {
+    Serial.printf("[-] MQTT connect failed, state=%d. Will retry in 10s in background...\n", mqttClient.state());
   }
 }
 
