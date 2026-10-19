@@ -39,7 +39,7 @@ const char* WIFI_SSID       = "B100A";     // Enter your local Wi-Fi SSID
 const char* WIFI_PASSWORD   = "12345678"; // Enter your local Wi-Fi Password
 
 // IP of the backend laptop/server running Mosquitto MQTT Broker
-const char* MQTT_BROKER_IP  = "192.168.0.102";     // Change to your laptop's IP
+const char* MQTT_BROKER_IP  = "192.168.0.100";     // Change to your laptop's IP
 const int   MQTT_PORT       = 1883;
 
 // Fixed MQTT Topics conforming to Table 4.8
@@ -54,6 +54,7 @@ const char* HEALTH_TOPIC    = "iotlab/storage/health";
 // =========================================================================
 const unsigned long HEARTBEAT_INTERVAL_MS = 30000; // 30 seconds (NFR-08)
 unsigned long lastHeartbeatTime = 0;
+unsigned long lastMqttRetryTime = 0;
 bool isCameraInitialized = false;
 
 // Cached baseline JPEG frame buffer in PSRAM
@@ -135,6 +136,8 @@ bool initCamera() {
 void setupHttpServer() {
   httpServer.on("/status", HTTP_GET, []() {
     httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    httpServer.sendHeader("Access-Control-Allow-Private-Network", "true");
+    httpServer.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     StaticJsonDocument<256> doc;
     doc["status"]         = "ok";
     doc["device_id"]      = DEVICE_ID;
@@ -150,6 +153,8 @@ void setupHttpServer() {
 
   httpServer.on("/capture", HTTP_GET, []() {
     httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    httpServer.sendHeader("Access-Control-Allow-Private-Network", "true");
+    httpServer.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
 
     // Check if mode=baseline is requested and cache is available
     if (httpServer.arg("mode") == "baseline" && latestBaselineBuf != nullptr && latestBaselineLen > 0) {
@@ -407,12 +412,16 @@ void ensureWiFiConnected() {
 }
 
 void ensureMQTTConnected() {
-  while (!mqttClient.connected()) {
-    if (WiFi.status() != WL_CONNECTED) {
-      ensureWiFiConnected();
-      if (WiFi.status() != WL_CONNECTED) return;
-    }
+  if (mqttClient.connected()) return;
 
+  if (WiFi.status() != WL_CONNECTED) {
+    ensureWiFiConnected();
+    if (WiFi.status() != WL_CONNECTED) return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastMqttRetryTime >= 10000 || lastMqttRetryTime == 0) {
+    lastMqttRetryTime = now;
     Serial.printf("[MQTT] Connecting to broker %s:%d...\n", MQTT_BROKER_IP, MQTT_PORT);
     if (mqttClient.connect(DEVICE_ID)) {
       Serial.println("[MQTT] Connected successfully!");
@@ -421,8 +430,7 @@ void ensureMQTTConnected() {
       Serial.printf("[MQTT Subscribed] Trigger: %s | Reference Config: %s\n", trigger_topic, config_topic);
       publishHealthTelemetry("BOOT_CONNECT");
     } else {
-      Serial.printf("[-] MQTT connect failed, state=%d. Retrying in 5s...\n", mqttClient.state());
-      delay(5000);
+      Serial.printf("[-] MQTT connect failed, state=%d. Will retry in 10s in background...\n", mqttClient.state());
     }
   }
 }
@@ -452,6 +460,7 @@ void setup() {
   mqttClient.setBufferSize(768);
 
   ensureMQTTConnected();
+  captureAndCacheBaseline();
   lastHeartbeatTime = millis();
 }
 
