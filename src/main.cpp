@@ -226,7 +226,7 @@ void setupHttpServer() {
 void captureAndCacheBaseline() {
   if (!isCameraInitialized) return;
 
-  camera_fb_t * fb = captureFreshFrame(true);
+  camera_fb_t * fb = captureFreshFrame(false);
 
   if (!fb) {
     Serial.println("[-] Failed to capture baseline frame.");
@@ -280,7 +280,7 @@ void captureAndCacheBaseline() {
 // =========================================================================
 // 7. LOCALIZED EXTRACTION VERIFICATION & REFERENCE CAPTURE HANDLER
 // =========================================================================
-void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture = false, int boxCount = 4, bool flashEnabled = true) {
+void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture = false, int boxCount = 4, bool flashEnabled = false) {
   Serial.printf("\n[+] Trigger Received (%s): Localized snapshot on %s...\n",
                 isReferenceCapture ? "REFERENCE_SAMPLE" : "STATE_VALIDATION", SHELF_ID);
 
@@ -340,7 +340,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // A. Vision Capture Trigger on iotlab/storage/RACK_01/trigger
   if (strcmp(command, "CAPTURE_STATE") == 0) {
     if (strcmp(SHELF_ID, target_shelf) == 0) {
-      handleCaptureTrigger(expected_action, false, 4, true);
+      handleCaptureTrigger(expected_action, false, 4, false);
     }
     return;
   }
@@ -348,7 +348,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // B. Reference Sample Capture on iotlab/storage/node/ESP32_R1_C1/config
   if (strcmp(command, "CAPTURE_REFERENCE") == 0) {
     int boxCount = doc["box_count"] | 4;
-    bool flashEnabled = doc["flash_enabled"] | true;
+    bool flashEnabled = doc["flash_enabled"] | false;
     handleCaptureTrigger("REFERENCE", true, boxCount, flashEnabled);
     return;
   }
