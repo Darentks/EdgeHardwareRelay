@@ -25,8 +25,10 @@
 
 // =========================================================================
 // 1. HARDWARE & FIXED COMPARTMENT CONFIGURATION
+//    - Back Camera  (Angle 1): DEVICE_ID = "ESP32_R1_C1_CAM1", SHELF_ID = "SHELF_R1_C1"
+//    - Front Camera (Angle 2): DEVICE_ID = "ESP32_R1_C1_CAM2", SHELF_ID = "SHELF_R1_C1"
 // =========================================================================
-const char* DEVICE_ID    = "ESP32_R1_C1";       // Unique MQTT Client & Node Identifier
+const char* DEVICE_ID    = "ESP32_R1_C1_CAM1";  // Change to ESP32_R1_C1_CAM2 for Front Camera (Angle 2)
 const char* RACK_ID      = "RACK_01";           // Fixed Rack Identifier
 const char* SHELF_ID     = "SHELF_R1_C1";       // Fixed Mapped Compartment Identifier
 const char* CAMERA_NAME  = "ESP32 Node R1-C1";  // Readable Camera Name
@@ -196,10 +198,10 @@ void setupHttpServer() {
       return;
     }
 
-    // Otherwise, capture a fresh live JPEG frame
-    bool useFlash = true;
-    if (httpServer.hasArg("flash") && httpServer.arg("flash") == "0") {
-      useFlash = false;
+    // Otherwise, capture a fresh live JPEG frame (default flash off to prevent glare on close-range boxes)
+    bool useFlash = false;
+    if (httpServer.hasArg("flash") && httpServer.arg("flash") == "1") {
+      useFlash = true;
     }
 
     camera_fb_t * fb = captureFreshFrame(useFlash);
