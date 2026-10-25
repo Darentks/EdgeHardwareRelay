@@ -22,6 +22,8 @@
 #include <ArduinoJson.h>
 #include "esp_camera.h"
 #include "camera_pins.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 // =========================================================================
 // 1. HARDWARE & FIXED COMPARTMENT CONFIGURATION
@@ -55,8 +57,10 @@ const char* HEALTH_TOPIC    = "iotlab/storage/health";
 // 3. HARDWARE, TIMING & PSRAM BASELINE BUFFER CONSTANTS
 // =========================================================================
 const unsigned long HEARTBEAT_INTERVAL_MS = 30000; // 30 seconds (NFR-08)
+const unsigned long POWERBANK_KEEPALIVE_MS = 8000; // 8-second keep-alive pulse
 unsigned long lastHeartbeatTime = 0;
 unsigned long lastMqttRetryTime = 0;
+unsigned long lastKeepAliveTime = 0;
 bool isCameraInitialized = false;
 
 // Cached baseline JPEG frame buffer in PSRAM
@@ -120,6 +124,13 @@ bool initCamera() {
     s->set_brightness(s, 1);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
+  }
+
+  // Flush 3 warm-up frames so OV2640 Auto White Balance (AWB) settles on boot
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t* warm = esp_camera_fb_get();
+    if (warm) esp_camera_fb_return(warm);
+    delay(80);
   }
 
   #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
@@ -392,6 +403,7 @@ void ensureWiFiConnected() {
 
   Serial.printf("[WiFi] Connecting to %s ", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // Disables Wi-Fi modem sleep so baseline current stays ~120mA (above power bank 80mA auto-off cutoff) and HTTP latency stays <70ms
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int retries = 0;
@@ -437,6 +449,8 @@ void ensureMQTTConnected() {
 // 11. SETUP & MAIN LOOP
 // =========================================================================
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector to prevent voltage-dip reboots on power banks
+
   Serial.begin(115200);
   delay(1000);
 
@@ -470,8 +484,18 @@ void loop() {
   }
   mqttClient.loop();
 
-  // 30-Second Baseline Cache Update & Health Heartbeat
   unsigned long now = millis();
+
+  // 8-Second USB Power Bank Keep-Alive Current Pulse (~220mA briefly resets auto-off timer)
+  if (now - lastKeepAliveTime >= POWERBANK_KEEPALIVE_MS) {
+    lastKeepAliveTime = now;
+    if (isCameraInitialized) {
+      camera_fb_t* ka = esp_camera_fb_get();
+      if (ka) esp_camera_fb_return(ka);
+    }
+  }
+
+  // 30-Second Baseline Cache Update & Health Heartbeat
   if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatTime = now;
     publishHealthTelemetry();
