@@ -20,21 +20,31 @@
 #include <WebServer.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
+#include <Update.h>
 #include "esp_camera.h"
 #include "camera_pins.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
 // =========================================================================
-// 1. HARDWARE & FIXED COMPARTMENT CONFIGURATION
-//    - Back Camera  (Angle 1): DEVICE_ID = "ESP32_R1_C1_CAM1", SHELF_ID = "SHELF_R1_C1"
-//    - Front Camera (Angle 2): DEVICE_ID = "ESP32_R1_C1_CAM2", SHELF_ID = "SHELF_R1_C1"
+// 1. HARDWARE & FIXED COMPARTMENT CONFIGURATION (Injected via extra_script.py)
 // =========================================================================
-const char* DEVICE_ID    = "ESP32_R1_C1_CAM1";  // Change to ESP32_R1_C1_CAM2 for Front Camera (Angle 2)
+#ifndef CUSTOM_DEVICE_ID
+#define CUSTOM_DEVICE_ID "ESP32_R1_C1_CAM1"
+#endif
+#ifndef CUSTOM_SHELF_ID
+#define CUSTOM_SHELF_ID "SHELF_R1_C1"
+#endif
+#ifndef CUSTOM_IP_OCTET
+#define CUSTOM_IP_OCTET 101
+#endif
+
+const char* DEVICE_ID    = CUSTOM_DEVICE_ID;
 const char* RACK_ID      = "RACK_01";           // Fixed Rack Identifier
-const char* SHELF_ID     = "SHELF_R1_C1";       // Fixed Mapped Compartment Identifier
-const char* CAMERA_NAME  = "ESP32 Node R1-C1";  // Readable Camera Name
-const char* FIRMWARE_VER = "v1.2.0-FreeRTOS";
+const char* SHELF_ID     = CUSTOM_SHELF_ID;     // Mapped Compartment Identifier
+const char* CAMERA_NAME  = CUSTOM_DEVICE_ID;    // Readable Camera Name
+const char* FIRMWARE_VER = "v1.3.0-HTTP-OTA";
 
 // =========================================================================
 // 2. NETWORK, HTTP SNAPSHOT SERVER & MQTT BROKER CONFIGURATION
@@ -46,12 +56,14 @@ const char* WIFI_PASSWORD   = "12345678"; // Enter your local Wi-Fi Password
 const char* MQTT_BROKER_IP  = "192.168.0.100";     // Change to your laptop's IP
 const int   MQTT_PORT       = 1883;
 
-// Fixed MQTT Topics conforming to Table 4.8
+// Dynamic MQTT Topics built from SHELF_ID and DEVICE_ID
 const char* trigger_topic   = "iotlab/storage/RACK_01/trigger";
-const char* response_topic  = "iotlab/storage/SHELF_R1_C1/response";
-const char* baseline_topic  = "iotlab/storage/SHELF_R1_C1/baseline";
-const char* config_topic    = "iotlab/storage/node/ESP32_R1_C1/config"; // Strictly for CAPTURE_REFERENCE
+String response_topic       = String("iotlab/storage/") + SHELF_ID + "/response";
+String baseline_topic       = String("iotlab/storage/") + SHELF_ID + "/baseline";
+String config_topic         = String("iotlab/storage/node/") + DEVICE_ID + "/config";
 const char* HEALTH_TOPIC    = "iotlab/storage/health";
+
+const int FLASH_BRIGHTNESS  = 38; // PWM 0..255 (38 = ~15% soft phone-flash brightness to prevent close-range glare)
 
 // =========================================================================
 // 3. HARDWARE, TIMING & PSRAM BASELINE BUFFER CONSTANTS
@@ -121,7 +133,7 @@ bool initCamera() {
 
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
-    s->set_brightness(s, 1);
+    s->set_brightness(s, 0);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
   }
@@ -135,7 +147,7 @@ bool initCamera() {
 
   #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
     pinMode(LED_FLASH_PIN, OUTPUT);
-    digitalWrite(LED_FLASH_PIN, LOW);
+    analogWrite(LED_FLASH_PIN, 0);
   #endif
 
   Serial.println("[+] Camera hardware initialized successfully.");
@@ -144,25 +156,25 @@ bool initCamera() {
 
 // Helper to flush DMA ring buffer and grab a fresh real-time frame
 camera_fb_t* captureFreshFrame(bool useFlash) {
-  // First, flush any stale frame sitting in the OV2640 DMA buffer
+  #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
+    if (useFlash) {
+      analogWrite(LED_FLASH_PIN, FLASH_BRIGHTNESS);
+      delay(120); // Let OV2640 auto-exposure settle under soft flash light
+    }
+  #endif
+
+  // Flush stale frame from DMA buffer while LED is already illuminating the compartment
   camera_fb_t* stale = esp_camera_fb_get();
   if (stale) {
     esp_camera_fb_return(stale);
   }
-
-  // Next, if useFlash is true, turn LED_FLASH_PIN HIGH and delay(60)
-  #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
-    if (useFlash) {
-      digitalWrite(LED_FLASH_PIN, HIGH);
-      delay(60);
-    }
-  #endif
+  delay(30);
 
   camera_fb_t* fb = esp_camera_fb_get();
 
   #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
     if (useFlash) {
-      digitalWrite(LED_FLASH_PIN, LOW);
+      analogWrite(LED_FLASH_PIN, 0);
     }
   #endif
 
@@ -209,10 +221,10 @@ void setupHttpServer() {
       return;
     }
 
-    // Otherwise, capture a fresh live JPEG frame (default flash off to prevent glare on close-range boxes)
-    bool useFlash = false;
-    if (httpServer.hasArg("flash") && httpServer.arg("flash") == "1") {
-      useFlash = true;
+    // Otherwise, capture a fresh live JPEG frame (flash on by default for dark rack)
+    bool useFlash = true;
+    if (httpServer.hasArg("flash") && httpServer.arg("flash") == "0") {
+      useFlash = false;
     }
 
     camera_fb_t * fb = captureFreshFrame(useFlash);
@@ -227,17 +239,98 @@ void setupHttpServer() {
     esp_camera_fb_return(fb);
   });
 
+  // HTTP Push OTA Firmware Update Endpoint (POST /update)
+  httpServer.on("/update", HTTP_POST, []() {
+    httpServer.sendHeader("Connection", "close");
+    bool ok = !Update.hasError();
+    httpServer.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
+    delay(200);
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = httpServer.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("[HTTP OTA] Receiving firmware: %s\n", upload.filename.c_str());
+      mqttClient.disconnect();
+      if (latestBaselineBuf != nullptr) {
+        free(latestBaselineBuf);
+        latestBaselineBuf = nullptr;
+        latestBaselineLen = 0;
+      }
+      if (isCameraInitialized) {
+        esp_camera_deinit();
+        isCameraInitialized = false;
+      }
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) {
+        Serial.printf("[HTTP OTA] Update Success: %u bytes. Rebooting...\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
+
   httpServer.begin();
-  Serial.println("[HTTP] Onboard ESP32 Snapshot Server started on port 80 (GET /capture).");
+  Serial.println("[HTTP] Onboard ESP32 Snapshot & OTA Server started on port 80 (GET /capture, POST /update).");
 }
 
 // =========================================================================
 // 6. BASELINE FRAME UPDATE & PSRAM CACHE (Every 30 seconds)
 // =========================================================================
+void setupOTA() {
+  ArduinoOTA.setHostname(DEVICE_ID);
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("[OTA] Starting wireless firmware update...");
+    
+    // 1. Stop network services so they don't interfere
+    httpServer.stop();
+    mqttClient.disconnect();
+
+    // 2. Free PSRAM baseline buffer and de-initialize camera DMA
+    if (latestBaselineBuf != nullptr) {
+      free(latestBaselineBuf);
+      latestBaselineBuf = nullptr;
+      latestBaselineLen = 0;
+    }
+    if (isCameraInitialized) {
+      esp_camera_deinit();
+      isCameraInitialized = false;
+    }
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\n[OTA] Update complete! Rebooting...");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("[OTA] Progress: %u%%\r", (progress / (total / 100)));
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("\n[OTA] Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed (Check partition scheme)");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed (Firewall blocking host port 32320)");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    ESP.restart(); // Reboot cleanly to restore camera if OTA fails
+  });
+
+  ArduinoOTA.begin();
+  Serial.printf("[OTA] Wireless OTA ready at %s (%s)\n", WiFi.localIP().toString().c_str(), DEVICE_ID);
+}
+
 void captureAndCacheBaseline() {
   if (!isCameraInitialized) return;
 
-  camera_fb_t * fb = captureFreshFrame(false);
+  camera_fb_t * fb = captureFreshFrame(true);
 
   if (!fb) {
     Serial.println("[-] Failed to capture baseline frame.");
@@ -283,15 +376,15 @@ void captureAndCacheBaseline() {
   char buffer[384];
   serializeJson(doc, buffer);
 
-  if (mqttClient.publish(baseline_topic, buffer)) {
-    Serial.printf("[Baseline Updated] %s -> %s\n", baseline_topic, buffer);
+  if (mqttClient.publish(baseline_topic.c_str(), buffer)) {
+    Serial.printf("[Baseline Updated] %s -> %s\n", baseline_topic.c_str(), buffer);
   }
 }
 
 // =========================================================================
 // 7. LOCALIZED EXTRACTION VERIFICATION & REFERENCE CAPTURE HANDLER
 // =========================================================================
-void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture = false, int boxCount = 4, bool flashEnabled = false) {
+void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture = false, int boxCount = 4, bool flashEnabled = true) {
   Serial.printf("\n[+] Trigger Received (%s): Localized snapshot on %s...\n",
                 isReferenceCapture ? "REFERENCE_SAMPLE" : "STATE_VALIDATION", SHELF_ID);
 
@@ -321,9 +414,9 @@ void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture =
   char buffer[384];
   serializeJson(doc, buffer);
 
-  // Publish to: iotlab/storage/SHELF_R1_C1/response
-  if (mqttClient.publish(response_topic, buffer)) {
-    Serial.printf("[MQTT Published] %s -> %s\n", response_topic, buffer);
+  // Publish to: iotlab/storage/<SHELF_ID>/response
+  if (mqttClient.publish(response_topic.c_str(), buffer)) {
+    Serial.printf("[MQTT Published] %s -> %s\n", response_topic.c_str(), buffer);
   } else {
     Serial.println("[-] Failed to publish verification response to broker.");
   }
@@ -351,15 +444,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // A. Vision Capture Trigger on iotlab/storage/RACK_01/trigger
   if (strcmp(command, "CAPTURE_STATE") == 0) {
     if (strcmp(SHELF_ID, target_shelf) == 0) {
-      handleCaptureTrigger(expected_action, false, 4, false);
+      handleCaptureTrigger(expected_action, false, 4, true);
     }
     return;
   }
 
-  // B. Reference Sample Capture on iotlab/storage/node/ESP32_R1_C1/config
+  // B. Reference Sample Capture on iotlab/storage/node/<DEVICE_ID>/config
   if (strcmp(command, "CAPTURE_REFERENCE") == 0) {
     int boxCount = doc["box_count"] | 4;
-    bool flashEnabled = doc["flash_enabled"] | false;
+    bool flashEnabled = doc["flash_enabled"] | true;
     handleCaptureTrigger("REFERENCE", true, boxCount, flashEnabled);
     return;
   }
@@ -404,6 +497,13 @@ void ensureWiFiConnected() {
   Serial.printf("[WiFi] Connecting to %s ", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false); // Disables Wi-Fi modem sleep so baseline current stays ~120mA (above power bank 80mA auto-off cutoff) and HTTP latency stays <70ms
+
+  IPAddress local_IP(192, 168, 0, CUSTOM_IP_OCTET);
+  IPAddress gateway(192, 168, 0, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress primaryDNS(8, 8, 8, 8);
+  WiFi.config(local_IP, gateway, subnet, primaryDNS);
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int retries = 0;
@@ -437,8 +537,8 @@ void ensureMQTTConnected() {
   if (mqttClient.connect(DEVICE_ID)) {
     Serial.println("[MQTT] Connected successfully!");
     mqttClient.subscribe(trigger_topic);
-    mqttClient.subscribe(config_topic);
-    Serial.printf("[MQTT Subscribed] Trigger: %s | Reference Config: %s\n", trigger_topic, config_topic);
+    mqttClient.subscribe(config_topic.c_str());
+    Serial.printf("[MQTT Subscribed] Trigger: %s | Reference Config: %s\n", trigger_topic, config_topic.c_str());
     publishHealthTelemetry("BOOT_CONNECT");
   } else {
     Serial.printf("[-] MQTT connect failed, state=%d. Will retry in 10s in background...\n", mqttClient.state());
@@ -466,6 +566,7 @@ void setup() {
 
   ensureWiFiConnected();
   setupHttpServer();
+  setupOTA();
 
   mqttClient.setServer(MQTT_BROKER_IP, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
@@ -477,6 +578,7 @@ void setup() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
   httpServer.handleClient();
 
   if (!mqttClient.connected()) {
