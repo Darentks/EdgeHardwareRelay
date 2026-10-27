@@ -12,6 +12,7 @@
     - FR-05 & FR-06: Localized extraction verification via camera snapshot
     - FR-10 & NFR-08: Asynchronous 30-second MQTT health telemetry & baseline cache
     - Table 4.8 & Section 4.7: MQTT topic structure and JSON payload schemas
+    - Dynamic NVS Provisioning (Preferences.h) + HTTP Push OTA (Update.h)
   =============================================================================
 */
 
@@ -21,14 +22,17 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
+#include <Preferences.h>
 #include <Update.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
 #include "esp_camera.h"
 #include "camera_pins.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
 // =========================================================================
-// 1. HARDWARE & FIXED COMPARTMENT CONFIGURATION (Injected via extra_script.py)
+// 1. HARDWARE & COMPARTMENT CONFIGURATION (Build Defaults + NVS Overrides)
 // =========================================================================
 #ifndef CUSTOM_DEVICE_ID
 #define CUSTOM_DEVICE_ID "ESP32_R1_C1_CAM1"
@@ -40,11 +44,14 @@
 #define CUSTOM_IP_OCTET 101
 #endif
 
-const char* DEVICE_ID    = CUSTOM_DEVICE_ID;
-const char* RACK_ID      = "RACK_01";           // Fixed Rack Identifier
-const char* SHELF_ID     = CUSTOM_SHELF_ID;     // Mapped Compartment Identifier
-const char* CAMERA_NAME  = CUSTOM_DEVICE_ID;    // Readable Camera Name
-const char* FIRMWARE_VER = "v1.3.0-HTTP-OTA";
+Preferences prefs;
+String deviceId   = CUSTOM_DEVICE_ID;
+String rackId     = "RACK_01";
+String shelfId    = CUSTOM_SHELF_ID;
+String cameraName = CUSTOM_DEVICE_ID;
+int    ipOctet    = CUSTOM_IP_OCTET;
+
+const char* FIRMWARE_VER = "v1.5.0-NVS-HTTP-OTA";
 
 // =========================================================================
 // 2. NETWORK, HTTP SNAPSHOT SERVER & MQTT BROKER CONFIGURATION
@@ -52,15 +59,19 @@ const char* FIRMWARE_VER = "v1.3.0-HTTP-OTA";
 const char* WIFI_SSID       = "B100A";     // Enter your local Wi-Fi SSID
 const char* WIFI_PASSWORD   = "12345678"; // Enter your local Wi-Fi Password
 
+// Supabase Cloud Configuration for Direct ESP32 Auto-Registration
+const char* SUPABASE_URL    = "https://hrufeowqpnyjfwxydocm.supabase.co";
+const char* SUPABASE_KEY    = "sb_publishable_zGEkwPhOLtDiNzSJXhB0wA_WDrgr0Gt";
+
 // IP of the backend laptop/server running Mosquitto MQTT Broker
 const char* MQTT_BROKER_IP  = "192.168.0.100";     // Change to your laptop's IP
 const int   MQTT_PORT       = 1883;
 
-// Dynamic MQTT Topics built from SHELF_ID and DEVICE_ID
-const char* trigger_topic   = "iotlab/storage/RACK_01/trigger";
-String response_topic       = String("iotlab/storage/") + SHELF_ID + "/response";
-String baseline_topic       = String("iotlab/storage/") + SHELF_ID + "/baseline";
-String config_topic         = String("iotlab/storage/node/") + DEVICE_ID + "/config";
+// Dynamic MQTT Topics built from rackId, shelfId, and deviceId
+String trigger_topic;
+String response_topic;
+String baseline_topic;
+String config_topic;
 const char* HEALTH_TOPIC    = "iotlab/storage/health";
 
 const int FLASH_BRIGHTNESS  = 38; // PWM 0..255 (38 = ~15% soft phone-flash brightness to prevent close-range glare)
@@ -86,6 +97,29 @@ WebServer httpServer(80);
 // Forward declarations
 void publishHealthTelemetry(const char* event = nullptr);
 void captureAndCacheBaseline();
+void syncIpDirectlyToSupabase();
+
+void rebuildMqttTopics() {
+  trigger_topic  = String("iotlab/storage/") + rackId + "/trigger";
+  response_topic = String("iotlab/storage/") + shelfId + "/response";
+  baseline_topic = String("iotlab/storage/") + shelfId + "/baseline";
+  config_topic   = String("iotlab/storage/node/") + deviceId + "/config";
+}
+
+void loadConfigFromNVS() {
+  prefs.begin("cam_cfg", true);
+  deviceId   = prefs.getString("device_id", CUSTOM_DEVICE_ID);
+  rackId     = prefs.getString("rack_id", "RACK_01");
+  shelfId    = prefs.getString("shelf_id", CUSTOM_SHELF_ID);
+  cameraName = prefs.getString("camera_name", deviceId);
+  ipOctet    = prefs.getInt("ip_octet", CUSTOM_IP_OCTET);
+  prefs.end();
+
+  if (ipOctet < 2 || ipOctet > 254) {
+    ipOctet = CUSTOM_IP_OCTET;
+  }
+  rebuildMqttTopics();
+}
 
 // =========================================================================
 // 4. CAMERA INITIALIZATION FUNCTION
@@ -182,37 +216,49 @@ camera_fb_t* captureFreshFrame(bool useFlash) {
 }
 
 // =========================================================================
-// 5. ONBOARD HTTP SNAPSHOT SERVER (PORT 80)
-//    - GET /capture?mode=baseline : Serves cached 30s baseline JPEG
-//    - GET /capture               : Captures fresh live JPEG image
-//    - GET /status                : Returns JSON status
+// 5. ONBOARD HTTP SNAPSHOT, NVS CONFIG & OTA SERVER (PORT 80)
 // =========================================================================
+void sendCorsHeaders() {
+  httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+  httpServer.sendHeader("Access-Control-Allow-Private-Network", "true");
+  httpServer.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  httpServer.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  httpServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  httpServer.sendHeader("Pragma", "no-cache");
+}
+
+void handleCorsPreflight() {
+  sendCorsHeaders();
+  httpServer.send(204);
+}
+
 void setupHttpServer() {
+  // CORS Preflight OPTIONS routes
+  httpServer.on("/status", HTTP_OPTIONS, handleCorsPreflight);
+  httpServer.on("/capture", HTTP_OPTIONS, handleCorsPreflight);
+  httpServer.on("/config", HTTP_OPTIONS, handleCorsPreflight);
+  httpServer.on("/update", HTTP_OPTIONS, handleCorsPreflight);
+
   httpServer.on("/status", HTTP_GET, []() {
-    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
-    httpServer.sendHeader("Access-Control-Allow-Private-Network", "true");
-    httpServer.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    httpServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    httpServer.sendHeader("Pragma", "no-cache");
-    StaticJsonDocument<256> doc;
+    sendCorsHeaders();
+    StaticJsonDocument<320> doc;
     doc["status"]         = "ok";
-    doc["device_id"]      = DEVICE_ID;
-    doc["mqtt_client_id"] = DEVICE_ID;
-    doc["rack_id"]        = RACK_ID;
-    doc["shelf_id"]       = SHELF_ID;
+    doc["device_id"]      = deviceId;
+    doc["mqtt_client_id"] = deviceId;
+    doc["rack_id"]        = rackId;
+    doc["shelf_id"]       = shelfId;
+    doc["camera_name"]    = cameraName;
+    doc["ip_octet"]       = ipOctet;
     doc["ip_address"]     = WiFi.localIP().toString();
     doc["rssi_dbm"]       = WiFi.RSSI();
+    doc["firmware_ver"]   = FIRMWARE_VER;
     String out;
     serializeJson(doc, out);
     httpServer.send(200, "application/json", out);
   });
 
   httpServer.on("/capture", HTTP_GET, []() {
-    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
-    httpServer.sendHeader("Access-Control-Allow-Private-Network", "true");
-    httpServer.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    httpServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    httpServer.sendHeader("Pragma", "no-cache");
+    sendCorsHeaders();
 
     // Check if mode=baseline is requested and cache is available
     if (httpServer.arg("mode") == "baseline" && latestBaselineBuf != nullptr && latestBaselineLen > 0) {
@@ -221,10 +267,10 @@ void setupHttpServer() {
       return;
     }
 
-    // Otherwise, capture a fresh live JPEG frame (flash on by default for dark rack)
-    bool useFlash = true;
-    if (httpServer.hasArg("flash") && httpServer.arg("flash") == "0") {
-      useFlash = false;
+    // Otherwise, capture a fresh live JPEG frame (flash off by default)
+    bool useFlash = false;
+    if (httpServer.hasArg("flash") && httpServer.arg("flash") == "1") {
+      useFlash = true;
     }
 
     camera_fb_t * fb = captureFreshFrame(useFlash);
@@ -239,8 +285,69 @@ void setupHttpServer() {
     esp_camera_fb_return(fb);
   });
 
+  // Runtime NVS Configuration Endpoint (POST /config)
+  httpServer.on("/config", HTTP_POST, []() {
+    sendCorsHeaders();
+    if (!httpServer.hasArg("plain")) {
+      httpServer.send(400, "application/json", "{\"error\":\"Missing JSON body\"}");
+      return;
+    }
+
+    StaticJsonDocument<384> doc;
+    DeserializationError err = deserializeJson(doc, httpServer.arg("plain"));
+    if (err) {
+      httpServer.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+      return;
+    }
+
+    prefs.begin("cam_cfg", false);
+    if (doc.containsKey("device_id")) {
+      deviceId = doc["device_id"].as<String>();
+      prefs.putString("device_id", deviceId);
+    }
+    if (doc.containsKey("rack_id")) {
+      rackId = doc["rack_id"].as<String>();
+      prefs.putString("rack_id", rackId);
+    }
+    if (doc.containsKey("shelf_id")) {
+      shelfId = doc["shelf_id"].as<String>();
+      prefs.putString("shelf_id", shelfId);
+    }
+    if (doc.containsKey("camera_name")) {
+      cameraName = doc["camera_name"].as<String>();
+      prefs.putString("camera_name", cameraName);
+    }
+    if (doc.containsKey("ip_octet")) {
+      int newOctet = doc["ip_octet"].as<int>();
+      if (newOctet >= 2 && newOctet <= 254) {
+        ipOctet = newOctet;
+        prefs.putInt("ip_octet", ipOctet);
+      }
+    }
+    prefs.end();
+    rebuildMqttTopics();
+
+    StaticJsonDocument<320> res;
+    res["status"]      = "ok";
+    res["message"]     = "Configuration saved to NVS. Rebooting...";
+    res["device_id"]   = deviceId;
+    res["rack_id"]     = rackId;
+    res["shelf_id"]    = shelfId;
+    res["camera_name"] = cameraName;
+    res["ip_octet"]    = ipOctet;
+    res["new_ip"]      = String("192.168.0.") + String(ipOctet);
+
+    String out;
+    serializeJson(res, out);
+    httpServer.send(200, "application/json", out);
+
+    delay(500);
+    ESP.restart();
+  });
+
   // HTTP Push OTA Firmware Update Endpoint (POST /update)
   httpServer.on("/update", HTTP_POST, []() {
+    sendCorsHeaders();
     httpServer.sendHeader("Connection", "close");
     bool ok = !Update.hasError();
     httpServer.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
@@ -277,23 +384,20 @@ void setupHttpServer() {
   });
 
   httpServer.begin();
-  Serial.println("[HTTP] Onboard ESP32 Snapshot & OTA Server started on port 80 (GET /capture, POST /update).");
+  Serial.println("[HTTP] Server started on port 80 (GET /status, GET /capture, POST /config, POST /update).");
 }
 
 // =========================================================================
 // 6. BASELINE FRAME UPDATE & PSRAM CACHE (Every 30 seconds)
 // =========================================================================
 void setupOTA() {
-  ArduinoOTA.setHostname(DEVICE_ID);
+  ArduinoOTA.setHostname(deviceId.c_str());
 
   ArduinoOTA.onStart([]() {
     Serial.println("[OTA] Starting wireless firmware update...");
-    
-    // 1. Stop network services so they don't interfere
     httpServer.stop();
     mqttClient.disconnect();
 
-    // 2. Free PSRAM baseline buffer and de-initialize camera DMA
     if (latestBaselineBuf != nullptr) {
       free(latestBaselineBuf);
       latestBaselineBuf = nullptr;
@@ -314,23 +418,18 @@ void setupOTA() {
   });
 
   ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("\n[OTA] Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed (Check partition scheme)");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed (Firewall blocking host port 32320)");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
-    ESP.restart(); // Reboot cleanly to restore camera if OTA fails
+    Serial.printf("\n[OTA] Error[%u]\n", error);
+    ESP.restart();
   });
 
   ArduinoOTA.begin();
-  Serial.printf("[OTA] Wireless OTA ready at %s (%s)\n", WiFi.localIP().toString().c_str(), DEVICE_ID);
+  Serial.printf("[OTA] Wireless OTA ready at %s (%s)\n", WiFi.localIP().toString().c_str(), deviceId.c_str());
 }
 
 void captureAndCacheBaseline() {
   if (!isCameraInitialized) return;
 
-  camera_fb_t * fb = captureFreshFrame(true);
+  camera_fb_t * fb = captureFreshFrame(false);
 
   if (!fb) {
     Serial.println("[-] Failed to capture baseline frame.");
@@ -362,10 +461,10 @@ void captureAndCacheBaseline() {
 
   // Publish baseline update notification to MQTT
   StaticJsonDocument<384> doc;
-  doc["device_id"]       = DEVICE_ID;
-  doc["mqtt_client_id"]  = DEVICE_ID;
-  doc["rack_id"]         = RACK_ID;
-  doc["shelf_id"]        = SHELF_ID;
+  doc["device_id"]       = deviceId;
+  doc["mqtt_client_id"]  = deviceId;
+  doc["rack_id"]         = rackId;
+  doc["shelf_id"]        = shelfId;
   doc["event"]           = "BASELINE_UPDATED";
   doc["ip_address"]      = WiFi.localIP().toString();
   doc["baseline_url"]    = "http://" + WiFi.localIP().toString() + "/capture?mode=baseline";
@@ -384,9 +483,9 @@ void captureAndCacheBaseline() {
 // =========================================================================
 // 7. LOCALIZED EXTRACTION VERIFICATION & REFERENCE CAPTURE HANDLER
 // =========================================================================
-void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture = false, int boxCount = 4, bool flashEnabled = true) {
+void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture = false, int boxCount = 4, bool flashEnabled = false) {
   Serial.printf("\n[+] Trigger Received (%s): Localized snapshot on %s...\n",
-                isReferenceCapture ? "REFERENCE_SAMPLE" : "STATE_VALIDATION", SHELF_ID);
+                isReferenceCapture ? "REFERENCE_SAMPLE" : "STATE_VALIDATION", shelfId.c_str());
 
   camera_fb_t * fb = captureFreshFrame(flashEnabled);
 
@@ -402,8 +501,8 @@ void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture =
 
   // Build JSON confirmation payload
   StaticJsonDocument<384> doc;
-  doc["device_id"]       = DEVICE_ID;
-  doc["shelf_id"]        = SHELF_ID;
+  doc["device_id"]       = deviceId;
+  doc["shelf_id"]        = shelfId;
   doc["expected_action"] = expected_action;
   doc["box_count"]       = boxCount;
   doc["status_code"]     = 200;
@@ -414,7 +513,7 @@ void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture =
   char buffer[384];
   serializeJson(doc, buffer);
 
-  // Publish to: iotlab/storage/<SHELF_ID>/response
+  // Publish to: iotlab/storage/<shelfId>/response
   if (mqttClient.publish(response_topic.c_str(), buffer)) {
     Serial.printf("[MQTT Published] %s -> %s\n", response_topic.c_str(), buffer);
   } else {
@@ -441,34 +540,66 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   Serial.printf("    Command: %s | Target Shelf: %s | Action: %s\n", command, target_shelf, expected_action);
 
-  // A. Vision Capture Trigger on iotlab/storage/RACK_01/trigger
+  // A. Vision Capture Trigger on iotlab/storage/<rackId>/trigger
   if (strcmp(command, "CAPTURE_STATE") == 0) {
-    if (strcmp(SHELF_ID, target_shelf) == 0) {
-      handleCaptureTrigger(expected_action, false, 4, true);
+    if (shelfId == target_shelf) {
+      handleCaptureTrigger(expected_action, false, 4, false);
     }
     return;
   }
 
-  // B. Reference Sample Capture on iotlab/storage/node/<DEVICE_ID>/config
+  // B. Reference Sample Capture on iotlab/storage/node/<deviceId>/config
   if (strcmp(command, "CAPTURE_REFERENCE") == 0) {
     int boxCount = doc["box_count"] | 4;
-    bool flashEnabled = doc["flash_enabled"] | true;
+    bool flashEnabled = doc["flash_enabled"] | false;
     handleCaptureTrigger("REFERENCE", true, boxCount, flashEnabled);
     return;
   }
 }
 
 // =========================================================================
-// 9. ASYNCHRONOUS HEALTH & TELEMETRY PING (Every 30s - NFR-08)
+// 9. SUPABASE CLOUD SELF-REGISTRATION & HEALTH TELEMETRY
 // =========================================================================
+void syncIpDirectlyToSupabase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/compartments?shelf_id=eq." + shelfId;
+  http.begin(url);
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=minimal");
+
+  StaticJsonDocument<256> doc;
+  String ipStr = WiFi.localIP().toString();
+  if (deviceId.endsWith("_CAM2")) {
+    doc["secondary_ip_address"]     = ipStr;
+    doc["secondary_mqtt_client_id"] = deviceId;
+  } else {
+    doc["ip_address"]     = ipStr;
+    doc["mqtt_client_id"] = deviceId;
+  }
+  doc["status"]          = "ONLINE";
+  doc["rssi_dbm"]        = WiFi.RSSI();
+  doc["free_heap_bytes"] = ESP.getFreeHeap();
+
+  String body;
+  serializeJson(doc, body);
+  int code = http.PATCH(body);
+  Serial.printf("[Supabase Auto-IP Sync] %s (%s) -> HTTP %d\n", deviceId.c_str(), ipStr.c_str(), code);
+  http.end();
+}
+
 void publishHealthTelemetry(const char* event) {
+  syncIpDirectlyToSupabase();
+
   String localIp = WiFi.localIP().toString();
   StaticJsonDocument<384> doc;
-  doc["device_id"]        = DEVICE_ID;
-  doc["mqtt_client_id"]   = DEVICE_ID;
-  doc["camera_name"]      = CAMERA_NAME;
-  doc["rack_id"]          = RACK_ID;
-  doc["shelf_id"]         = SHELF_ID;
+  doc["device_id"]        = deviceId;
+  doc["mqtt_client_id"]   = deviceId;
+  doc["camera_name"]      = cameraName;
+  doc["rack_id"]          = rackId;
+  doc["shelf_id"]         = shelfId;
   doc["ip_address"]       = localIp;
   doc["snapshot_url"]     = String("http://") + localIp + "/capture";
   doc["mac_address"]      = WiFi.macAddress();
@@ -498,7 +629,7 @@ void ensureWiFiConnected() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false); // Disables Wi-Fi modem sleep so baseline current stays ~120mA (above power bank 80mA auto-off cutoff) and HTTP latency stays <70ms
 
-  IPAddress local_IP(192, 168, 0, CUSTOM_IP_OCTET);
+  IPAddress local_IP(192, 168, 0, ipOctet);
   IPAddress gateway(192, 168, 0, 1);
   IPAddress subnet(255, 255, 255, 0);
   IPAddress primaryDNS(8, 8, 8, 8);
@@ -517,6 +648,15 @@ void ensureWiFiConnected() {
     Serial.println("\n[WiFi] Connected!");
     Serial.printf("       IP: %s | Snapshot URL: http://%s/capture\n",
                   WiFi.localIP().toString().c_str(), WiFi.localIP().toString().c_str());
+
+    String mdnsName = deviceId;
+    mdnsName.toLowerCase();
+    if (MDNS.begin(mdnsName.c_str())) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.printf("       mDNS URL: http://%s.local/capture\n", mdnsName.c_str());
+    }
+
+    syncIpDirectlyToSupabase();
   } else {
     Serial.println("\n[-] [WiFi] Connection timed out. Will retry.");
   }
@@ -534,11 +674,11 @@ void ensureMQTTConnected() {
   lastMqttRetryTime = millis();
 
   Serial.printf("[MQTT] Connecting to broker %s:%d...\n", MQTT_BROKER_IP, MQTT_PORT);
-  if (mqttClient.connect(DEVICE_ID)) {
+  if (mqttClient.connect(deviceId.c_str())) {
     Serial.println("[MQTT] Connected successfully!");
-    mqttClient.subscribe(trigger_topic);
+    mqttClient.subscribe(trigger_topic.c_str());
     mqttClient.subscribe(config_topic.c_str());
-    Serial.printf("[MQTT Subscribed] Trigger: %s | Reference Config: %s\n", trigger_topic, config_topic.c_str());
+    Serial.printf("[MQTT Subscribed] Trigger: %s | Reference Config: %s\n", trigger_topic.c_str(), config_topic.c_str());
     publishHealthTelemetry("BOOT_CONNECT");
   } else {
     Serial.printf("[-] MQTT connect failed, state=%d. Will retry in 10s in background...\n", mqttClient.state());
@@ -554,9 +694,12 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  loadConfigFromNVS();
+
   Serial.println("\n=======================================================");
   Serial.println("  SMART STORAGE FYP - ESP32 CAMERA HARDWARE RELAY NODE");
-  Serial.printf("  Device: %s | Shelf: %s | Rack: %s\n", DEVICE_ID, SHELF_ID, RACK_ID);
+  Serial.printf("  Device: %s | Shelf: %s | Rack: %s | IP: 192.168.0.%d\n",
+                deviceId.c_str(), shelfId.c_str(), rackId.c_str(), ipOctet);
   Serial.println("=======================================================");
 
   isCameraInitialized = initCamera();

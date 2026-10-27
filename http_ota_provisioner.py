@@ -50,7 +50,7 @@ def http_ota_upload(source, target, env):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=45) as resp:
             resp_text = resp.read().decode("utf-8", errors="ignore")
             print(f"[HTTP OTA] Success ({resp.status}): {resp_text}")
             return 0
