@@ -24,7 +24,6 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <Update.h>
-#include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include "esp_camera.h"
 #include "camera_pins.h"
@@ -41,7 +40,7 @@
 #define CUSTOM_SHELF_ID "SHELF_R1_C1"
 #endif
 #ifndef CUSTOM_IP_OCTET
-#define CUSTOM_IP_OCTET 101
+#define CUSTOM_IP_OCTET 201
 #endif
 
 Preferences prefs;
@@ -59,10 +58,6 @@ const char* FIRMWARE_VER = "v1.5.0-NVS-HTTP-OTA";
 const char* WIFI_SSID       = "B100A";     // Enter your local Wi-Fi SSID
 const char* WIFI_PASSWORD   = "12345678"; // Enter your local Wi-Fi Password
 
-// Supabase Cloud Configuration for Direct ESP32 Auto-Registration
-const char* SUPABASE_URL    = "https://hrufeowqpnyjfwxydocm.supabase.co";
-const char* SUPABASE_KEY    = "sb_publishable_zGEkwPhOLtDiNzSJXhB0wA_WDrgr0Gt";
-
 // IP of the backend laptop/server running Mosquitto MQTT Broker
 const char* MQTT_BROKER_IP  = "192.168.0.100";     // Change to your laptop's IP
 const int   MQTT_PORT       = 1883;
@@ -74,7 +69,8 @@ String baseline_topic;
 String config_topic;
 const char* HEALTH_TOPIC    = "iotlab/storage/health";
 
-const int FLASH_BRIGHTNESS  = 38; // PWM 0..255 (38 = ~15% soft phone-flash brightness to prevent close-range glare)
+const int FLASH_BRIGHTNESS   = 12; // PWM 0..255 (12 = ~5% low-current soft flash to prevent 5V rail voltage dips & DMA hangs)
+const int FLASH_LEDC_CHANNEL = 7;  // Dedicated LEDC channel 7 (Timer 3) so flash PWM never overwrites Camera XCLK on Channel 0 (Timer 0)
 
 // =========================================================================
 // 3. HARDWARE, TIMING & PSRAM BASELINE BUFFER CONSTANTS
@@ -86,9 +82,16 @@ unsigned long lastMqttRetryTime = 0;
 unsigned long lastKeepAliveTime = 0;
 bool isCameraInitialized = false;
 
-// Cached baseline JPEG frame buffer in PSRAM
+// Cached baseline & triggered capture JPEG frame buffers in PSRAM
 uint8_t* latestBaselineBuf = nullptr;
 size_t   latestBaselineLen = 0;
+uint8_t* latestCaptureBuf  = nullptr;
+size_t   latestCaptureLen  = 0;
+
+// Baseline freeze window so 30s periodic updates don't overwrite the "before" state during active operations
+const unsigned long BASELINE_COOLDOWN_MS = 15000;
+unsigned long baselinePauseUntil = 0;
+bool isBaselineFrozen = false;
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -97,7 +100,6 @@ WebServer httpServer(80);
 // Forward declarations
 void publishHealthTelemetry(const char* event = nullptr);
 void captureAndCacheBaseline();
-void syncIpDirectlyToSupabase();
 
 void rebuildMqttTopics() {
   trigger_topic  = String("iotlab/storage/") + rackId + "/trigger";
@@ -125,6 +127,12 @@ void loadConfigFromNVS() {
 // 4. CAMERA INITIALIZATION FUNCTION
 // =========================================================================
 bool initCamera() {
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+
+  Serial.printf("[PSRAM] psramFound=%d | Total=%u bytes | Free=%u bytes\n",
+                psramFound(), ESP.getPsramSize(), ESP.getFreePsram());
+
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -152,11 +160,13 @@ bool initCamera() {
     config.jpeg_quality = 12;              // High quality
     config.fb_count     = 2;
     config.grab_mode    = CAMERA_GRAB_LATEST;
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
   } else {
     config.frame_size   = FRAMESIZE_QVGA;  // 320x240 fallback if no PSRAM
-    config.jpeg_quality = 15;
+    config.jpeg_quality = 16;
     config.fb_count     = 1;
-    config.grab_mode    = CAMERA_GRAB_LATEST;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
   }
 
   esp_err_t err = esp_camera_init(&config);
@@ -180,8 +190,9 @@ bool initCamera() {
   }
 
   #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
-    pinMode(LED_FLASH_PIN, OUTPUT);
-    analogWrite(LED_FLASH_PIN, 0);
+    ledcSetup(FLASH_LEDC_CHANNEL, 5000, 8);
+    ledcAttachPin(LED_FLASH_PIN, FLASH_LEDC_CHANNEL);
+    ledcWrite(FLASH_LEDC_CHANNEL, 0);
   #endif
 
   Serial.println("[+] Camera hardware initialized successfully.");
@@ -192,7 +203,7 @@ bool initCamera() {
 camera_fb_t* captureFreshFrame(bool useFlash) {
   #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
     if (useFlash) {
-      analogWrite(LED_FLASH_PIN, FLASH_BRIGHTNESS);
+      ledcWrite(FLASH_LEDC_CHANNEL, FLASH_BRIGHTNESS);
       delay(120); // Let OV2640 auto-exposure settle under soft flash light
     }
   #endif
@@ -205,10 +216,14 @@ camera_fb_t* captureFreshFrame(bool useFlash) {
   delay(30);
 
   camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    delay(100);
+    fb = esp_camera_fb_get();
+  }
 
   #if defined(LED_FLASH_PIN) && LED_FLASH_PIN >= 0
     if (useFlash) {
-      analogWrite(LED_FLASH_PIN, 0);
+      ledcWrite(FLASH_LEDC_CHANNEL, 0);
     }
   #endif
 
@@ -225,6 +240,12 @@ void sendCorsHeaders() {
   httpServer.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   httpServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   httpServer.sendHeader("Pragma", "no-cache");
+}
+
+void sendBinaryResponse(const char* contentType, const uint8_t* buf, size_t len) {
+  httpServer.setContentLength(len);
+  httpServer.send(200, contentType, "");
+  httpServer.client().write(buf, len);
 }
 
 void handleCorsPreflight() {
@@ -260,20 +281,33 @@ void setupHttpServer() {
   httpServer.on("/capture", HTTP_GET, []() {
     sendCorsHeaders();
 
-    // Check if mode=baseline is requested and cache is available
-    if (httpServer.arg("mode") == "baseline" && latestBaselineBuf != nullptr && latestBaselineLen > 0) {
+    String mode = httpServer.arg("mode");
+
+    // 1. Return cached baseline frame if mode=baseline
+    if (mode == "baseline" && latestBaselineBuf != nullptr && latestBaselineLen > 0) {
       httpServer.sendHeader("Content-Disposition", "inline; filename=esp32_baseline.jpg");
-      httpServer.send_P(200, "image/jpeg", (const char*)latestBaselineBuf, latestBaselineLen);
+      sendBinaryResponse("image/jpeg", latestBaselineBuf, latestBaselineLen);
       return;
     }
 
-    // Otherwise, capture a fresh live JPEG frame (flash off by default)
-    bool useFlash = false;
-    if (httpServer.hasArg("flash") && httpServer.arg("flash") == "1") {
-      useFlash = true;
+    // 2. Return cached triggered snapshot if mode=live or mode=triggered (avoids double flash/capture)
+    if ((mode == "live" || mode == "triggered") && latestCaptureBuf != nullptr && latestCaptureLen > 0) {
+      httpServer.sendHeader("Content-Disposition", "inline; filename=esp32_capture.jpg");
+      sendBinaryResponse("image/jpeg", latestCaptureBuf, latestCaptureLen);
+      return;
+    }
+
+    // 3. Otherwise, capture a fresh live JPEG frame (soft flash on by default for dark rack)
+    bool useFlash = true;
+    if (httpServer.hasArg("flash") && httpServer.arg("flash") == "0") {
+      useFlash = false;
     }
 
     camera_fb_t * fb = captureFreshFrame(useFlash);
+    if (!fb) {
+      delay(100);
+      fb = captureFreshFrame(useFlash);
+    }
 
     if (!fb) {
       httpServer.send(500, "application/json", "{\"error\":\"Snapshot capture failed\"}");
@@ -281,7 +315,7 @@ void setupHttpServer() {
     }
 
     httpServer.sendHeader("Content-Disposition", "inline; filename=esp32_capture.jpg");
-    httpServer.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
+    sendBinaryResponse("image/jpeg", fb->buf, fb->len);
     esp_camera_fb_return(fb);
   });
 
@@ -363,6 +397,11 @@ void setupHttpServer() {
         latestBaselineBuf = nullptr;
         latestBaselineLen = 0;
       }
+      if (latestCaptureBuf != nullptr) {
+        free(latestCaptureBuf);
+        latestCaptureBuf = nullptr;
+        latestCaptureLen = 0;
+      }
       if (isCameraInitialized) {
         esp_camera_deinit();
         isCameraInitialized = false;
@@ -403,6 +442,11 @@ void setupOTA() {
       latestBaselineBuf = nullptr;
       latestBaselineLen = 0;
     }
+    if (latestCaptureBuf != nullptr) {
+      free(latestCaptureBuf);
+      latestCaptureBuf = nullptr;
+      latestCaptureLen = 0;
+    }
     if (isCameraInitialized) {
       esp_camera_deinit();
       isCameraInitialized = false;
@@ -429,7 +473,11 @@ void setupOTA() {
 void captureAndCacheBaseline() {
   if (!isCameraInitialized) return;
 
-  camera_fb_t * fb = captureFreshFrame(false);
+  camera_fb_t * fb = captureFreshFrame(true);
+  if (!fb) {
+    delay(100);
+    fb = captureFreshFrame(true);
+  }
 
   if (!fb) {
     Serial.println("[-] Failed to capture baseline frame.");
@@ -483,18 +531,51 @@ void captureAndCacheBaseline() {
 // =========================================================================
 // 7. LOCALIZED EXTRACTION VERIFICATION & REFERENCE CAPTURE HANDLER
 // =========================================================================
-void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture = false, int boxCount = 4, bool flashEnabled = false) {
+void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture = false, int boxCount = 4, bool flashEnabled = true) {
   Serial.printf("\n[+] Trigger Received (%s): Localized snapshot on %s...\n",
                 isReferenceCapture ? "REFERENCE_SAMPLE" : "STATE_VALIDATION", shelfId.c_str());
 
+  // Pause 30s baseline auto-updates while the backend fetches and compares the before/after frames
+  baselinePauseUntil = millis() + BASELINE_COOLDOWN_MS;
+  isBaselineFrozen = false;
+
+  // Stagger CAM2 slightly on dual-camera shelves so both LEDs don't flash and blind each other simultaneously
+  if (!isReferenceCapture && deviceId.endsWith("CAM2")) {
+    delay(250);
+  }
+
   camera_fb_t * fb = captureFreshFrame(flashEnabled);
+  if (!fb) {
+    delay(100);
+    fb = captureFreshFrame(flashEnabled);
+  }
 
   if (!fb) {
     Serial.println("[-] ERROR: Snapshot capture failed!");
     return;
   }
 
-  // Release frame buffer immediately to preserve SRAM (bypasses 520KB constraint)
+  // Cache the triggered frame in PSRAM/heap so HTTP GET /capture?mode=live serves the exact frame captured here
+  if (latestCaptureBuf != nullptr) {
+    free(latestCaptureBuf);
+    latestCaptureBuf = nullptr;
+    latestCaptureLen = 0;
+  }
+
+  if (psramFound()) {
+    latestCaptureBuf = (uint8_t*)ps_malloc(fb->len);
+  } else {
+    latestCaptureBuf = (uint8_t*)malloc(fb->len);
+  }
+
+  if (latestCaptureBuf != nullptr) {
+    memcpy(latestCaptureBuf, fb->buf, fb->len);
+    latestCaptureLen = fb->len;
+  } else {
+    Serial.println("[-] Memory allocation failed for triggered frame cache.");
+  }
+
+  // Release camera DMA buffer immediately to preserve SRAM (bypasses 520KB constraint)
   esp_camera_fb_return(fb);
 
   String localIp = WiFi.localIP().toString();
@@ -508,7 +589,7 @@ void handleCaptureTrigger(const char* expected_action, bool isReferenceCapture =
   doc["status_code"]     = 200;
   doc["ip_address"]      = localIp;
   doc["baseline_url"]    = String("http://") + localIp + "/capture?mode=baseline";
-  doc["latest_url"]      = String("http://") + localIp + "/capture?mode=live";
+  doc["latest_url"]      = String("http://") + localIp + "/capture?mode=live" + (flashEnabled ? "" : "&flash=0");
 
   char buffer[384];
   serializeJson(doc, buffer);
@@ -536,14 +617,39 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   const char* command = doc["command"] | "";
   const char* target_shelf = doc["shelf_id"] | "";
+  const char* target_device = doc["device_id"] | "";
   const char* expected_action = doc["expected_action"] | "BORROW";
 
   Serial.printf("    Command: %s | Target Shelf: %s | Action: %s\n", command, target_shelf, expected_action);
 
+  // Optional baseline freeze/unfreeze commands if backend signals when a shelf compartment is opened/closed
+  if (strcmp(command, "FREEZE_BASELINE") == 0 || strcmp(command, "LOCK_BASELINE") == 0) {
+    if (shelfId == target_shelf || strlen(target_shelf) == 0) {
+      isBaselineFrozen = true;
+      baselinePauseUntil = millis() + 60000; // Auto-expire freeze after 60s safety timeout
+      Serial.println("    [Baseline] Frozen for active shelf interaction.");
+    }
+    return;
+  }
+
+  if (strcmp(command, "UNFREEZE_BASELINE") == 0 || strcmp(command, "UNLOCK_BASELINE") == 0) {
+    if (shelfId == target_shelf || strlen(target_shelf) == 0) {
+      isBaselineFrozen = false;
+      baselinePauseUntil = 0;
+      Serial.println("    [Baseline] Unfrozen; capturing fresh baseline.");
+      captureAndCacheBaseline();
+    }
+    return;
+  }
+
   // A. Vision Capture Trigger on iotlab/storage/<rackId>/trigger
   if (strcmp(command, "CAPTURE_STATE") == 0) {
-    if (shelfId == target_shelf) {
-      handleCaptureTrigger(expected_action, false, 4, false);
+    bool shelfMatch = (shelfId == target_shelf);
+    bool deviceMatch = (strlen(target_device) == 0 || deviceId == target_device);
+    if (shelfMatch && deviceMatch) {
+      bool flashEnabled = doc["flash_enabled"] | true;
+      int boxCount = doc["box_count"] | 4;
+      handleCaptureTrigger(expected_action, false, boxCount, flashEnabled);
     }
     return;
   }
@@ -551,48 +657,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // B. Reference Sample Capture on iotlab/storage/node/<deviceId>/config
   if (strcmp(command, "CAPTURE_REFERENCE") == 0) {
     int boxCount = doc["box_count"] | 4;
-    bool flashEnabled = doc["flash_enabled"] | false;
+    bool flashEnabled = doc["flash_enabled"] | true;
     handleCaptureTrigger("REFERENCE", true, boxCount, flashEnabled);
     return;
   }
 }
 
 // =========================================================================
-// 9. SUPABASE CLOUD SELF-REGISTRATION & HEALTH TELEMETRY
+// 9. ASYNCHRONOUS HEALTH & TELEMETRY PING (Every 30s - NFR-08)
 // =========================================================================
-void syncIpDirectlyToSupabase() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/compartments?shelf_id=eq." + shelfId;
-  http.begin(url);
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Prefer", "return=minimal");
-
-  StaticJsonDocument<256> doc;
-  String ipStr = WiFi.localIP().toString();
-  if (deviceId.endsWith("_CAM2")) {
-    doc["secondary_ip_address"]     = ipStr;
-    doc["secondary_mqtt_client_id"] = deviceId;
-  } else {
-    doc["ip_address"]     = ipStr;
-    doc["mqtt_client_id"] = deviceId;
-  }
-  doc["status"]          = "ONLINE";
-  doc["rssi_dbm"]        = WiFi.RSSI();
-  doc["free_heap_bytes"] = ESP.getFreeHeap();
-
-  String body;
-  serializeJson(doc, body);
-  int code = http.PATCH(body);
-  Serial.printf("[Supabase Auto-IP Sync] %s (%s) -> HTTP %d\n", deviceId.c_str(), ipStr.c_str(), code);
-  http.end();
-}
-
 void publishHealthTelemetry(const char* event) {
-  syncIpDirectlyToSupabase();
-
   String localIp = WiFi.localIP().toString();
   StaticJsonDocument<384> doc;
   doc["device_id"]        = deviceId;
@@ -655,8 +729,6 @@ void ensureWiFiConnected() {
       MDNS.addService("http", "tcp", 80);
       Serial.printf("       mDNS URL: http://%s.local/capture\n", mdnsName.c_str());
     }
-
-    syncIpDirectlyToSupabase();
   } else {
     Serial.println("\n[-] [WiFi] Connection timed out. Will retry.");
   }
@@ -691,6 +763,9 @@ void ensureMQTTConnected() {
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector to prevent voltage-dip reboots on power banks
 
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+
   Serial.begin(115200);
   delay(1000);
 
@@ -716,6 +791,12 @@ void setup() {
   mqttClient.setBufferSize(768);
 
   ensureMQTTConnected();
+
+  delay(500);
+  if (isCameraInitialized) {
+    camera_fb_t* warmup = esp_camera_fb_get();
+    if (warmup) esp_camera_fb_return(warmup);
+  }
   captureAndCacheBaseline();
   lastHeartbeatTime = millis();
 }
@@ -744,6 +825,17 @@ void loop() {
   if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatTime = now;
     publishHealthTelemetry();
-    captureAndCacheBaseline();
+
+    // Auto-expire baseline freeze if the pause window has elapsed
+    if (baselinePauseUntil != 0 && (long)(now - baselinePauseUntil) >= 0) {
+      baselinePauseUntil = 0;
+      isBaselineFrozen = false;
+    }
+
+    if (!isBaselineFrozen && baselinePauseUntil == 0) {
+      captureAndCacheBaseline();
+    } else {
+      Serial.println("[Baseline] Skipping 30s baseline update (shelf verification active).");
+    }
   }
 }

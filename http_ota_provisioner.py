@@ -9,15 +9,16 @@ import urllib.error
 # 1. Read custom camera options from active platformio.ini environment
 cam_id = env.GetProjectOption("custom_cam_id", "ESP32_R1_C1_CAM1")
 shelf_id = env.GetProjectOption("custom_shelf_id", "SHELF_R1_C1")
-ip_octet = env.GetProjectOption("custom_ip_octet", "101")
+ip_octet = env.GetProjectOption("custom_ip_octet", "201")
 ota_mode = env.GetProjectOption("custom_ota_mode", "")
 
-# Inject macro definitions for src/main.cpp
-env.Append(CPPDEFINES=[
-    ("CUSTOM_DEVICE_ID", env.StringifyMacro(cam_id)),
-    ("CUSTOM_SHELF_ID", env.StringifyMacro(shelf_id)),
-    ("CUSTOM_IP_OCTET", int(ip_octet))
-])
+# Inject macro definitions for src/main.cpp (only once when running pre + post)
+if not any(isinstance(d, tuple) and d[0] == "CUSTOM_DEVICE_ID" for d in env.get("CPPDEFINES", [])):
+    env.Append(CPPDEFINES=[
+        ("CUSTOM_DEVICE_ID", env.StringifyMacro(cam_id)),
+        ("CUSTOM_SHELF_ID", env.StringifyMacro(shelf_id)),
+        ("CUSTOM_IP_OCTET", int(ip_octet))
+    ])
 
 
 def http_ota_upload(source, target, env):
@@ -30,10 +31,9 @@ def http_ota_upload(source, target, env):
         firmware_data = f.read()
 
     boundary = "----ESP32CamOTAUpdateBoundary"
-    filename = os.path.basename(firmware_path)
     header = (
         f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="update"; filename="{filename}"\r\n'
+        f'Content-Disposition: form-data; name="file"; filename="firmware.bin"\r\n'
         f"Content-Type: application/octet-stream\r\n\r\n"
     ).encode("utf-8")
     footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
